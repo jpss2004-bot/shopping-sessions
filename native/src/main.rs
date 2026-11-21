@@ -3,6 +3,7 @@ mod compact;
 mod dedup;
 mod fastrows;
 mod identity;
+mod identity_index;
 mod input;
 mod output;
 mod scan;
@@ -23,6 +24,7 @@ type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>
 const SHARDS: usize = 128;
 
 fn link_map(data: &Path, keys: &Keys) -> Result<AHashMap<Key, Key>> {
+    let start = Instant::now();
     let files = Files::open(&data.join("links"))?;
     let chunks = files.chunks();
     let edges: Vec<Vec<_>> = chunks
@@ -37,7 +39,45 @@ fn link_map(data: &Path, keys: &Keys) -> Result<AHashMap<Key, Key>> {
             edges
         })
         .collect();
-    Ok(identity::build(edges, keys))
+    let loaded = start.elapsed();
+    let result = match env::var("IDENTITY_ENGINE").as_deref() {
+        Ok("compact") => identity_index::compact(edges, keys),
+        Ok("bucket") => identity_index::bucketed(edges, keys),
+        Ok("stock") | Err(std::env::VarError::NotPresent) => identity::build(edges, keys),
+        _ => return Err("IDENTITY_ENGINE must be stock, compact or bucket".into()),
+    };
+    let graph_time = start.elapsed() - loaded;
+    if env::var_os("PROFILE").is_some() {
+        eprintln!(
+            "identity_edges_us={} graph_us={}",
+            loaded.as_micros(),
+            graph_time.as_micros()
+        );
+    }
+    if env::var_os("LINK_BENCH").is_some() {
+        let names = keys.names();
+        let mut fingerprint = 0u64;
+        for (&key, &canonical) in &result {
+            let digest = |k| {
+                names
+                    .bytes(k, &mut [0; 9])
+                    .iter()
+                    .fold(0xcbf2_9ce4_8422_2325u64, |h, b| {
+                        (h ^ u64::from(*b)).wrapping_mul(0x100_0000_01b3)
+                    })
+            };
+            fingerprint =
+                fingerprint.wrapping_add(hash(digest(key) ^ digest(canonical).rotate_left(17)));
+        }
+        eprintln!(
+            "linkbench graph_us={} load_us={} mappings={} fingerprint={:016x}",
+            graph_time.as_micros(),
+            loaded.as_micros(),
+            result.len(),
+            fingerprint
+        );
+    }
+    Ok(result)
 }
 fn buckets<T>() -> Vec<Vec<T>> {
     (0..SHARDS).map(|_| Vec::new()).collect()
@@ -159,6 +199,17 @@ fn run() -> Result<()> {
     };
     let data = PathBuf::from(env::var_os("DATA_DIR").unwrap_or_else(|| "/data".into()));
     let output = PathBuf::from(env::var_os("OUTPUT_DIR").unwrap_or_else(|| "/output".into()));
+    if env::var_os("LINK_BENCH").is_some() {
+        let threads = env::var("NCPU")
+            .unwrap_or_else(|_| "8".into())
+            .parse::<usize>()?
+            .max(1);
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .build_global()?;
+        link_map(&data, &Keys::default())?;
+        return Ok(());
+    }
     let manifest: serde_json::Value =
         serde_json::from_slice(&fs::read(data.join("manifest.json"))?)?;
     let timestamp = |field: &str| -> Result<i64> {
