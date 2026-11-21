@@ -135,12 +135,26 @@ fn winners(
     }
     out
 }
+fn merge_campaigns(shards: impl IntoIterator<Item = CampaignDays>) -> CampaignDays {
+    let mut totals = CampaignDays::new();
+    for days in shards {
+        for (key, v) in days {
+            let d = totals.entry(key).or_default();
+            d.sessions += v.sessions;
+            d.purchases += v.purchases;
+            d.revenue += v.revenue;
+            d.assists += v.assists;
+        }
+    }
+    totals
+}
+
 fn run() -> Result<()> {
     let start = Instant::now();
     let profile = env::var_os("PROFILE").is_some();
     let mark = |name: &str| {
         if profile {
-            eprintln!("{name} {:.3}", start.elapsed().as_secs_f64())
+            eprintln!("{name} {:.6}", start.elapsed().as_secs_f64())
         }
     };
     let data = PathBuf::from(env::var_os("DATA_DIR").unwrap_or_else(|| "/data".into()));
@@ -195,10 +209,17 @@ fn run() -> Result<()> {
         .and_then(|v| v.parse::<usize>().ok())
         .unwrap_or(4)
         .max(1);
+    mark("join_start");
     let (canon, parsed) = rayon::join(
-        || link_map(&data, &keys),
         || {
-            events
+            mark("links_start");
+            let canon = link_map(&data, &keys);
+            mark("links_ready");
+            canon
+        },
+        || {
+            mark("events_start");
+            let parsed = events
                 .chunks()
                 .par_chunks(group_size)
                 .map(|group| {
@@ -250,9 +271,12 @@ fn run() -> Result<()> {
                     }
                     parts
                 })
-                .collect::<Vec<_>>()
+                .collect::<Vec<_>>();
+            mark("events_ready");
+            parsed
         },
     );
+    mark("join_released");
     let canon = canon?;
     drop(events);
     mark("parsed events and resolved identities");
@@ -266,10 +290,16 @@ fn run() -> Result<()> {
     if env::var_os("PROFILE_MEMORY").is_some() {
         compact::report(&parsed);
     }
+    let first_winner = std::sync::atomic::AtomicBool::new(true);
     let events = redistribute(
         compact::transpose(parsed)
             .into_par_iter()
-            .map(|parts| winners(parts, lo, &mode, &canon))
+            .map(|parts| {
+                if profile && first_winner.swap(false, std::sync::atomic::Ordering::Relaxed) {
+                    mark("first_dedup_task");
+                }
+                winners(parts, lo, &mode, &canon)
+            })
             .collect(),
     );
     report_buffers("linked events", &events);
@@ -310,36 +340,67 @@ fn run() -> Result<()> {
     drop(canon);
     mark("parsed clicks");
     let names = keys.names();
-    let results: Vec<_> = events
-        .into_par_iter()
-        .zip(redistribute(ads))
-        .map(|(e, c)| tables::summarize(gather(e), gather(c), &names, &categories))
-        .collect();
-    mark("computed daily tables");
     let users = output.join("user_daily");
     let campaign_dir = output.join("campaign_daily");
     fs::create_dir_all(&users)?;
     fs::create_dir_all(&campaign_dir)?;
-    let mut totals = CampaignDays::new();
-    let mut shards = Vec::new();
-    for (rows, days) in results {
-        shards.push(rows);
-        for (key, v) in days {
-            let d = totals.entry(key).or_default();
-            d.sessions += v.sessions;
-            d.purchases += v.purchases;
-            d.revenue += v.revenue;
-            d.assists += v.assists;
-        }
-    }
     let partitions = threads.min(SHARDS);
-    shards
-        .par_chunks(SHARDS.div_ceil(partitions))
-        .enumerate()
-        .try_for_each(|(part, group)| {
-            let path = users.join(format!("part-{part}.parquet"));
-            output::users(&path, group, &names, &categories)
-        })?;
+    let group_size = SHARDS.div_ceil(partitions);
+    let shards = events.into_par_iter().zip(redistribute(ads));
+    let summarize = |(e, c)| tables::summarize(gather(e), gather(c), &names, &categories);
+    let path = |part| users.join(format!("part-{part}.parquet"));
+
+    let totals = match env::var("USER_WRITE_SCHEDULE").as_deref() {
+        Ok("early") => {
+            // The writer pulls each shard after it is summarized. A partition owns
+            // its file and can close row groups while the other partitions aggregate.
+            let groups: Vec<Vec<CampaignDays>> = shards
+                .chunks(group_size)
+                .enumerate()
+                .map(|(part, group)| -> Result<_> {
+                    let mut days = Vec::with_capacity(group.len());
+                    let mut first_ready = None;
+                    let mut last_ready = None;
+                    let rows = group.into_iter().map(summarize).map(|(rows, credits)| {
+                        if profile {
+                            let ready = start.elapsed();
+                            first_ready.get_or_insert(ready);
+                            last_ready = Some(ready);
+                        }
+                        days.push(credits);
+                        rows
+                    });
+                    output::users(&path(part), rows, &names, &categories)?;
+                    if let (Some(first), Some(last)) = (first_ready, last_ready) {
+                        eprintln!(
+                            "user_partition {part} first_ready={:.6} last_ready={:.6} closed={:.6}",
+                            first.as_secs_f64(),
+                            last.as_secs_f64(),
+                            start.elapsed().as_secs_f64()
+                        );
+                    }
+                    Ok(days)
+                })
+                .collect::<Result<_>>()?;
+            mark("user_files_closed");
+            merge_campaigns(groups.into_iter().flatten())
+        }
+        Ok("deferred") | Err(std::env::VarError::NotPresent) => {
+            let results: Vec<_> = shards.map(summarize).collect();
+            let (rows, days): (Vec<_>, Vec<_>) = results.into_iter().unzip();
+            mark("all_user_rows_ready");
+            // Keep the official order, including the merge before opening user files.
+            let totals = merge_campaigns(days);
+            rows.par_chunks(group_size)
+                .enumerate()
+                .try_for_each(|(part, group)| {
+                    output::users(&path(part), group, &names, &categories)
+                })?;
+            mark("user_files_closed");
+            totals
+        }
+        _ => return Err("USER_WRITE_SCHEDULE must be early or deferred".into()),
+    };
     output::campaigns(
         &campaign_dir.join("part-0.parquet"),
         totals,

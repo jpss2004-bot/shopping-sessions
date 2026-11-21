@@ -5,9 +5,11 @@ RUN rustc --edition=2024 -C opt-level=3 -o /normalize /src/normalize.rs
 WORKDIR /src/engine
 COPY native/Cargo.toml native/Cargo.lock ./
 COPY native/src/ src/
-COPY scripts/pgo.sh /pgo.sh
-COPY profiles/amd64/ /profiles/amd64/
-RUN bash /pgo.sh build /profiles/amd64 /shopping-sessions
+# Compare both writer schedules in the same uninstrumented release build.
+RUN --mount=type=cache,target=/usr/local/cargo/registry --mount=type=cache,target=/build \
+    CARGO_BUILD_JOBS=4 RUSTFLAGS="-Ctarget-cpu=x86-64" cargo build --locked \
+      --release --target x86_64-unknown-linux-gnu --target-dir /build \
+    && cp /build/x86_64-unknown-linux-gnu/release/shopping-sessions /shopping-sessions
 
 FROM python:3.12-slim-bookworm
 

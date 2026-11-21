@@ -81,37 +81,39 @@ fn user_names(batch: &[UserDay], names: &Names) -> Vec<ByteArray> {
     values
 }
 
-pub fn users(
+pub fn users<T: AsRef<[UserDay]>>(
     path: &Path,
-    shards: &[Vec<UserDay>],
+    shards: impl IntoIterator<Item = T>,
     names: &Names,
     categories: &[Key],
 ) -> Result<()> {
     let compact = compact_layout()?;
     let mut out = file(path, USERS, compact)?;
     let labels: Vec<_> = categories.iter().map(|&k| string(names, k)).collect();
-    for batch in shards.iter().flat_map(|rows| rows.chunks(65536)) {
-        let mut g = out.next_row_group()?;
-        let ids = if compact {
-            user_names(batch, names)
-        } else {
-            batch.iter().map(|r| string(names, r.user)).collect()
-        };
-        column::<ByteArrayType>(&mut g, ids, None)?;
-        column::<Int32Type>(&mut g, batch.iter().map(|r| r.day).collect(), None)?;
-        column::<Int64Type>(&mut g, batch.iter().map(|r| r.sessions).collect(), None)?;
-        column::<Int64Type>(&mut g, batch.iter().map(|r| r.events).collect(), None)?;
-        column::<Int64Type>(&mut g, batch.iter().map(|r| r.revenue).collect(), None)?;
-        let defs: Vec<_> = batch.iter().map(|r| i16::from(r.top.is_some())).collect();
-        column::<ByteArrayType>(
-            &mut g,
-            batch
-                .iter()
-                .filter_map(|r| r.top.map(|c| labels[c as usize].clone()))
-                .collect(),
-            Some(&defs),
-        )?;
-        g.close()?;
+    for shard in shards {
+        for batch in shard.as_ref().chunks(65536) {
+            let mut g = out.next_row_group()?;
+            let ids = if compact {
+                user_names(batch, names)
+            } else {
+                batch.iter().map(|r| string(names, r.user)).collect()
+            };
+            column::<ByteArrayType>(&mut g, ids, None)?;
+            column::<Int32Type>(&mut g, batch.iter().map(|r| r.day).collect(), None)?;
+            column::<Int64Type>(&mut g, batch.iter().map(|r| r.sessions).collect(), None)?;
+            column::<Int64Type>(&mut g, batch.iter().map(|r| r.events).collect(), None)?;
+            column::<Int64Type>(&mut g, batch.iter().map(|r| r.revenue).collect(), None)?;
+            let defs: Vec<_> = batch.iter().map(|r| i16::from(r.top.is_some())).collect();
+            column::<ByteArrayType>(
+                &mut g,
+                batch
+                    .iter()
+                    .filter_map(|r| r.top.map(|c| labels[c as usize].clone()))
+                    .collect(),
+                Some(&defs),
+            )?;
+            g.close()?;
+        }
     }
     out.close()?;
     Ok(())
