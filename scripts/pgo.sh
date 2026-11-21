@@ -28,7 +28,7 @@ done
 [[ $(cargo -V) == 'cargo 1.85.1 (d73d2caf9 2024-12-31)' ]] || die "unexpected Cargo version"
 [[ -f $engine/Cargo.lock ]] || die "mount native at $engine"
 unset CARGO_ENCODED_RUSTFLAGS RUSTFLAGS
-export CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=4 RAYON_NUM_THREADS=4
+export CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=2 RAYON_NUM_THREADS=4
 
 source_manifest() (
     cd "$1"
@@ -78,6 +78,11 @@ if [[ $mode == train ]]; then
         compgen -G "$root/output/campaign_daily/*.parquet" >/dev/null || die "missing campaign output for $seed"
         compgen -G "$work/raw/seed-$seed-*.profraw" >/dev/null || die "missing counts for seed $seed"
     done
+    # An optional second runner can collect counts for another runtime-selected CPU path.
+    # It receives the exact instrumented binary, raw output directory and public datasets.
+    if [[ -n ${PGO_EXTRA_RUNNER:-} ]]; then
+        "$PGO_EXTRA_RUNNER" "$binary" "$work/raw" "$work/seed-11/data" "$work/seed-37/data" "$work/seed-109/data"
+    fi
     "$profdata" merge -o "$work/merged.profdata" "$work/raw/"*.profraw
     "$profdata" show --profile-version "$work/merged.profdata" | tee "$work/summary"
     grep -Fxq 'Profile version: 12' "$work/summary" || die "expected indexed profile v12"
@@ -85,6 +90,7 @@ if [[ $mode == train ]]; then
     grep -Eq '^Maximum internal block count: [1-9][0-9]*$' "$work/summary" || die "empty block counters"
     cp "$work/summary" "$work/bundle/summary.txt"
     "$profdata" show --function=intel_rows_tuned --counts "$work/merged.profdata" > "$work/bundle/scanner-counts.txt"
+    "$profdata" show --function=wide6decode --counts "$work/merged.profdata" > "$work/bundle/wide-counts.txt"
     # Check the checkout stayed unchanged throughout training, including new Rust modules.
     source_manifest "$engine" | cmp - "$work/bundle/source.sha256"
     gzip -nc "$work/merged.profdata" > "$work/bundle/merged.profdata.gz"

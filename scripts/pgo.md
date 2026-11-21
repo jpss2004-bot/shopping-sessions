@@ -1,8 +1,8 @@
-# Opt-in Linux amd64 PGO
+# Linux amd64 PGO
 
 Train once for a fixed source revision using the supplied public dataset generator. The three training seeds are 11, 37 and 109, each with 120,000 events and 30,000 clicks. Generated CSVs, output tables and raw profiles live in the temporary training container. The retained bundle holds LLVM instrumentation counts, the source and profile checksums, and the compiler settings.
 
-From the repository root, unpack the supplied generator into `.local/generator` and run the following on a scheduled build machine. The generator directory must contain its Cargo manifest, lockfile and source. The script checks their digest against the organizer archive. Prefer an amd64 machine exposing AVX2 so runtime feature selection exercises the scorer’s scanner path. Docker Desktop emulation can expose a different CPU feature set and compile more slowly.
+From the repository root, unpack the supplied generator into `.local/generator` and run the following on a scheduled build machine. The generator directory must contain its Cargo manifest, lockfile and source. The script checks their digest against the organizer archive. On a Linux amd64 machine with AVX-512F/BW enabled by the OS, training exercises the wide scanner. An AVX2 machine exercises the whole-row fallback.
 
 ```sh
 mkdir -p .local/pgo
@@ -24,10 +24,12 @@ docker run --rm --platform linux/amd64 --cpus 4 --memory 4g \
 
 The builder pins rustc 1.85.1, LLVM 19.1.7 (raw profile v10, indexed v12), the amd64 bookworm image manifest, Cargo.lock and the `x86_64-unknown-linux-gnu` target. Both phases use release mode and `-Ctarget-cpu=x86-64`. Generation and profile use are the two phases of instrumentation PGO. Distinct seeds get separate raw profiles, which the matching Rust toolchain’s llvm-profdata merges. Runtime thread scheduling can change the exact counts across training runs. [Rust PGO workflow](https://doc.rust-lang.org/rustc/profile-guided-optimization.html)
 
-Training and compilation use four worker threads. The bundle’s `summary.txt` records the merged function and block counts. Its `scanner-counts.txt` records counters for the runtime-selected whole-row Intel scanner. Positive counts there confirm that the training environment exercised that implementation.
+The compiler runs two build jobs. Training uses the three generated datasets on the training CPU. The optional `PGO_EXTRA_RUNNER` environment variable names an executable that also trains on another CPU. The script passes it the identical instrumented engine, a writable raw-profile directory and the three dataset directories in seed order. The runner executes the engine with the requested dataset and a distinct `LLVM_PROFILE_FILE` in the raw directory for each seed. The script merges counts from both environments.
+
+The included profile covers the AVX2 whole-row fallback and the AVX-512F/BW scanner. Each path processed seeds 11, 37 and 109. A Bochs Skylake-X Linux guest ran the wide path, and the AVX2 runs used the Docker Desktop amd64 environment. The local training bundle’s `summary.txt`, `scanner-counts.txt` and `wide-counts.txt` record the merged counters.
 
 ## Scorer build
 
 The root Dockerfile compiles with the trained profile during each image build. The build checks the compiler version, trainer digest, manifest of every Rust source file, and compressed profile checksum before compilation. The final image copies the resulting binary from the builder.
 
-The tracked bundle under `profiles/amd64/` contains the four files used by the build. Training used the unmodified Rust sources at `94236ea5f631362df343297fc892395034b59cde`. Retrain after changing the Rust sources, dependency lockfile, or PGO script.
+The tracked bundle under `profiles/amd64/` contains the four files used by the build. The source manifest includes the wide scanner assembly and its Rust caller. Retrain after changing the engine source, dependency lockfile or PGO script.

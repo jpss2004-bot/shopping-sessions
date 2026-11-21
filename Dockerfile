@@ -11,6 +11,10 @@ RUN bash /pgo.sh build /profiles/amd64 /shopping-sessions
 
 FROM python:3.12-slim-bookworm
 
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends libmimalloc2.0=2.0.9+ds-2 \
+    && rm -rf /var/lib/apt/lists/*
+
 # The scorer runs the container as uid 1000; give that uid a name and a home.
 RUN useradd --uid 1000 --no-create-home --home-dir /scratch app
 

@@ -6,6 +6,7 @@ enum Scanner {
     Scalar,
     WholeRow,
     WholeIntel,
+    Wide,
     Avx2,
 }
 
@@ -23,7 +24,7 @@ impl Scanner {
                     Self::Scalar
                 }
             }
-            _ => panic!("SHOPPING_SCAN must be auto, scalar, whole, whole-intel, or avx2"),
+            _ => panic!("SHOPPING_SCAN must be auto, scalar, whole, whole-intel, wide, or avx2"),
         }
     }
 
@@ -41,7 +42,13 @@ impl Scanner {
                 && std::is_x86_feature_detected!("popcnt");
             #[cfg(not(target_arch = "x86_64"))]
             let bmi_popcnt = false;
-            let request = std::env::var("SHOPPING_SCAN").unwrap_or_else(|_| "whole-intel".into());
+            let request = std::env::var("SHOPPING_SCAN").unwrap_or_else(|_| "wide".into());
+            if request == "wide" {
+                if crate::wide::available() {
+                    return Scanner::Wide;
+                }
+                return Self::select("whole-intel", avx2, bmi_popcnt);
+            }
             Self::select(&request, avx2, bmi_popcnt)
         })
     }
@@ -49,6 +56,10 @@ impl Scanner {
 
 pub fn rows<const N: usize>(chunk: &[u8], visit: impl FnMut([&[u8]; N])) {
     let selected = Scanner::for_process();
+    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+    if selected == Scanner::Wide {
+        return unsafe { crate::wide::rows(chunk, visit) };
+    }
     #[cfg(target_arch = "x86_64")]
     if selected == Scanner::WholeIntel {
         // The process-wide dispatch above checks every enabled feature.
@@ -65,7 +76,7 @@ pub fn rows<const N: usize>(chunk: &[u8], visit: impl FnMut([&[u8]; N])) {
     scalar_rows(chunk, visit);
 }
 
-pub fn scalar_rows<const N: usize>(chunk: &[u8], mut visit: impl FnMut([&[u8]; N])) {
+pub fn scalar_rows<'a, const N: usize>(chunk: &'a [u8], mut visit: impl FnMut([&'a [u8]; N])) {
     let mut start = 0;
     for end in memchr_iter(b'\n', chunk).chain(std::iter::once(chunk.len())) {
         if end > start {

@@ -8,6 +8,7 @@ mod output;
 mod scan;
 mod singletons;
 mod tables;
+mod wide;
 use ahash::AHashMap;
 use input::{BAD, DAY, Files, Key, Keys, WEEK, hash, rows, stamp};
 use rayon::prelude::*;

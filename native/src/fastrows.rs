@@ -42,7 +42,7 @@ unsafe fn intel_mask_words(block: &[u8; 32]) -> (u32, u32) {
 }
 
 #[inline(always)]
-fn fields<'a, const N: usize>(
+pub(super) fn fields<'a, const N: usize>(
     line: &'a [u8],
     mut commas: u128,
     quotes: u128,
