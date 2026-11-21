@@ -20,7 +20,11 @@ unsafe extern "C" {
 pub(super) fn available() -> bool {
     #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
     {
-        std::is_x86_feature_detected!("avx512f") && std::is_x86_feature_detected!("avx512bw")
+        std::is_x86_feature_detected!("avx512f")
+            && std::is_x86_feature_detected!("avx512bw")
+            && std::is_x86_feature_detected!("bmi1")
+            && std::is_x86_feature_detected!("bmi2")
+            && std::is_x86_feature_detected!("popcnt")
     }
     #[cfg(not(all(target_arch = "x86_64", target_os = "linux")))]
     {
@@ -62,41 +66,82 @@ fn aligned_mask(
     bits & ((1u128 << len) - 1)
 }
 
-fn decode<'a, const N: usize>(
-    data: &'a [u8],
-    mut visit: impl FnMut([&'a [u8]; N]),
-    mut classify: impl FnMut(&[u8], &mut [Masks]),
-) {
-    let mut previous = Masks::default();
-    let mut older = Masks::default();
-    let mut base = 0;
-    let mut start = 0;
-    let mut consume = |m: Masks| {
+#[derive(Default)]
+struct RowState {
+    previous: Masks,
+    older: Masks,
+    base: usize,
+    start: usize,
+}
+
+impl RowState {
+    #[inline(always)]
+    fn consume<'a, const N: usize>(
+        &mut self,
+        m: Masks,
+        data: &'a [u8],
+        visit: &mut impl FnMut([&'a [u8]; N]),
+    ) {
         let mut lfs = m.linefeeds;
         while lfs != 0 {
-            let end = base + lfs.trailing_zeros() as usize;
+            let end = self.base + lfs.trailing_zeros() as usize;
             lfs &= lfs - 1;
-            let len = end - start;
+            let len = end - self.start;
             if len > 127 {
-                scalar_rows(&data[start..end], &mut visit);
+                scalar_rows(&data[self.start..end], &mut *visit);
             } else if len != 0 {
-                let commas =
-                    aligned_mask(previous.commas, older.commas, m.commas, base, start, len);
-                let quotes = if (previous.quotes | older.quotes | m.quotes) == 0 {
+                let commas = aligned_mask(
+                    self.previous.commas,
+                    self.older.commas,
+                    m.commas,
+                    self.base,
+                    self.start,
+                    len,
+                );
+                let quotes = if (self.previous.quotes | self.older.quotes | m.quotes) == 0 {
                     0
                 } else {
-                    aligned_mask(previous.quotes, older.quotes, m.quotes, base, start, len)
+                    aligned_mask(
+                        self.previous.quotes,
+                        self.older.quotes,
+                        m.quotes,
+                        self.base,
+                        self.start,
+                        len,
+                    )
                 };
-                if let Some(row) = fields(&data[start..end], commas, quotes) {
+                if let Some(row) = fields(&data[self.start..end], commas, quotes) {
                     visit(row);
                 }
             }
-            start = end + 1;
+            self.start = end + 1;
         }
-        older = previous;
-        previous = m;
-        base += 64;
-    };
+        self.older = self.previous;
+        self.previous = m;
+        self.base += 64;
+    }
+
+    // Keep the row mask alignment, field-count popcounts and bit extraction
+    // together under the same CPU-feature boundary.
+    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+    #[target_feature(enable = "bmi1,bmi2,popcnt")]
+    unsafe fn consume_tuned<'a, const N: usize>(
+        &mut self,
+        m: Masks,
+        data: &'a [u8],
+        visit: &mut impl FnMut([&'a [u8]; N]),
+    ) {
+        self.consume(m, data, visit);
+    }
+}
+
+fn decode<'a, const N: usize, V: FnMut([&'a [u8]; N])>(
+    data: &'a [u8],
+    mut visit: V,
+    mut classify: impl FnMut(&[u8], &mut [Masks]),
+    mut consume: impl FnMut(&mut RowState, Masks, &'a [u8], &mut V),
+) {
+    let mut state = RowState::default();
     const BATCH: usize = 32;
     let full = data.len() / 64 * 64;
     let mut masks = [Masks::default(); BATCH];
@@ -104,7 +149,7 @@ fn decode<'a, const N: usize>(
         let out = &mut masks[..bytes.len() / 64];
         classify(bytes, out);
         for &mask in out.iter() {
-            consume(mask);
+            consume(&mut state, mask, data, &mut visit);
         }
     }
     let tail = &data[full..];
@@ -112,16 +157,21 @@ fn decode<'a, const N: usize>(
     // Every complete input chunk ends at an LF or EOF. The synthetic LF
     // handles an unterminated last record and requires no out-of-bounds load.
     m.linefeeds |= 1 << tail.len();
-    consume(m);
+    consume(&mut state, m, data, &mut visit);
 }
 
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
 pub(super) unsafe fn rows<'a, const N: usize>(data: &'a [u8], visit: impl FnMut([&'a [u8]; N])) {
-    decode(data, visit, |input, output| {
-        // The process-wide dispatch checks AVX-512F/BW. Each output element
-        // corresponds to one fully readable 64-byte block. count is positive.
-        unsafe { shopping_wide_masks(input.as_ptr(), output.as_mut_ptr(), output.len()) }
-    })
+    decode(
+        data,
+        visit,
+        |input, output| {
+            // The process-wide dispatch checks AVX-512F/BW. Each output element
+            // corresponds to one fully readable 64-byte block. count is positive.
+            unsafe { shopping_wide_masks(input.as_ptr(), output.as_mut_ptr(), output.len()) }
+        },
+        |state, m, data, v| unsafe { state.consume_tuned(m, data, v) },
+    )
 }
 
 #[cfg(test)]
@@ -140,6 +190,7 @@ mod tests {
                     *mask = scalar_mask(segment);
                 }
             },
+            RowState::consume,
         );
         assert_eq!(emulated, expected);
         #[cfg(all(target_arch = "x86_64", target_os = "linux"))]

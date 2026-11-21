@@ -2,7 +2,7 @@
 
 Train once for a fixed source revision using the supplied public dataset generator. The three training seeds are 11, 37 and 109, each with 120,000 events and 30,000 clicks. Generated CSVs, output tables and raw profiles live in the temporary training container. The retained bundle holds LLVM instrumentation counts, the source and profile checksums, and the compiler settings.
 
-From the repository root, unpack the supplied generator into `.local/generator` and run the following on a scheduled build machine. The generator directory must contain its Cargo manifest, lockfile and source. The script checks their digest against the organizer archive. On a Linux amd64 machine with AVX-512F/BW enabled by the OS, training exercises the wide scanner. An AVX2 machine exercises the whole-row fallback.
+From the repository root, unpack the supplied generator into `.local/generator` and run the following on a scheduled build machine. The generator directory must contain its Cargo manifest, lockfile and source. The script checks their digest against the organizer archive. On a Linux amd64 machine with OS-enabled AVX-512F/BW and BMI1/BMI2/POPCNT, training exercises the wide scanner. An AVX2 machine exercises the whole-row fallback.
 
 ```sh
 mkdir -p .local/pgo
@@ -26,7 +26,7 @@ The builder pins rustc 1.85.1, LLVM 19.1.7 (raw profile v10, indexed v12), the a
 
 The compiler runs two build jobs. Training uses the three generated datasets on the training CPU. The optional `PGO_EXTRA_RUNNER` environment variable names an executable that also trains on another CPU. The script passes it the identical instrumented engine, a writable raw-profile directory and the three dataset directories in seed order. The runner executes the engine with the requested dataset and a distinct `LLVM_PROFILE_FILE` in the raw directory for each seed. The script merges counts from both environments.
 
-The included profile covers the AVX2 whole-row fallback and the AVX-512F/BW scanner. Each path processed seeds 11, 37 and 109. A Bochs Skylake-X Linux guest ran the wide path, and the AVX2 runs used the Docker Desktop amd64 environment. The local training bundle’s `summary.txt`, `scanner-counts.txt` and `wide-counts.txt` record the merged counters.
+The included profile covers the AVX2 whole-row fallback and the AVX-512F/BW scanner with BMI1/BMI2/POPCNT row decoding. Each path processed seeds 11, 37 and 109. A Bochs Skylake-X Linux guest ran the wide path, and the AVX2 runs used the Docker Desktop amd64 environment. The local training bundle’s `summary.txt`, `scanner-counts.txt` and `wide-counts.txt` record the merged counters.
 
 ## Scorer build
 

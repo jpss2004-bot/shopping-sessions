@@ -90,7 +90,7 @@ if [[ $mode == train ]]; then
     grep -Eq '^Maximum internal block count: [1-9][0-9]*$' "$work/summary" || die "empty block counters"
     cp "$work/summary" "$work/bundle/summary.txt"
     "$profdata" show --function=intel_rows_tuned --counts "$work/merged.profdata" > "$work/bundle/scanner-counts.txt"
-    "$profdata" show --function=wide6decode --counts "$work/merged.profdata" > "$work/bundle/wide-counts.txt"
+    "$profdata" show --function=consume_tuned --counts "$work/merged.profdata" > "$work/bundle/wide-counts.txt"
     # Check the checkout stayed unchanged throughout training, including new Rust modules.
     source_manifest "$engine" | cmp - "$work/bundle/source.sha256"
     gzip -nc "$work/merged.profdata" > "$work/bundle/merged.profdata.gz"
