@@ -9,4 +9,4 @@ target: x86_64-unknown-linux-gnu
 flags: -Ctarget-cpu=x86-64
 format: llvm-instr-pgo-indexed-v12
 generator: 8fafe63a66ac2db2094d5caa3c0d8b0dafa21162c6b9ebbff89e53d25371e860
-pgo-script: f83b37289d93fb68bb033689e81a3f45f371bacb3b28377d4d8d27863502d236
+pgo-script: 31834309ec37f564f8bbdab20e04b4ea37f192645a2404629b8ab8622beb8319

@@ -9,14 +9,6 @@ struct Masks {
     quotes: u64,
 }
 
-#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
-std::arch::global_asm!(include_str!("wide_masks.S"));
-
-#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
-unsafe extern "C" {
-    fn shopping_wide_masks(input: *const u8, output: *mut Masks, count: usize);
-}
-
 pub(super) fn available() -> bool {
     #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
     {
@@ -121,20 +113,9 @@ impl RowState {
         self.base += 64;
     }
 
-    // Keep the row mask alignment, field-count popcounts and bit extraction
-    // together under the same CPU-feature boundary.
-    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
-    #[target_feature(enable = "bmi1,bmi2,popcnt")]
-    unsafe fn consume_tuned<'a, const N: usize>(
-        &mut self,
-        m: Masks,
-        data: &'a [u8],
-        visit: &mut impl FnMut([&'a [u8]; N]),
-    ) {
-        self.consume(m, data, visit);
-    }
 }
 
+#[cfg(test)]
 fn decode<'a, const N: usize, V: FnMut([&'a [u8]; N])>(
     data: &'a [u8],
     mut visit: V,
@@ -161,17 +142,51 @@ fn decode<'a, const N: usize, V: FnMut([&'a [u8]; N])>(
 }
 
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
-pub(super) unsafe fn rows<'a, const N: usize>(data: &'a [u8], visit: impl FnMut([&'a [u8]; N])) {
-    decode(
-        data,
-        visit,
-        |input, output| {
-            // The process-wide dispatch checks AVX-512F/BW. Each output element
-            // corresponds to one fully readable 64-byte block. count is positive.
-            unsafe { shopping_wide_masks(input.as_ptr(), output.as_mut_ptr(), output.len()) }
-        },
-        |state, m, data, v| unsafe { state.consume_tuned(m, data, v) },
-    )
+#[target_feature(enable = "bmi1,bmi2,popcnt")]
+pub(super) unsafe fn register_rows_tuned<'a, const N: usize>(
+    data: &'a [u8],
+    mut visit: impl FnMut([&'a [u8]; N]),
+) {
+    // A four-byte repeated marker fits an EVEX broadcast memory operand. Each
+    // XOR makes matching bytes zero. VPTESTNMB compares those bytes with zero.
+    // No vector register needs to survive a call into the row visitor.
+    static COMMA: u32 = 0x2c2c2c2c;
+    static LF: u32 = 0x0a0a0a0a;
+    static QUOTE: u32 = 0x22222222;
+    let mut state = RowState::default();
+    let mut blocks = data.chunks_exact(64);
+    for block in blocks.by_ref() {
+        let (commas, linefeeds, quotes): (u64, u64, u64);
+        // The dispatcher checks AVX-512F/BW; each block has exactly 64 bytes.
+        // All vector and mask temporaries are declared clobbered. Outputs go
+        // directly into integer registers before any Rust callback can run.
+        unsafe {
+            std::arch::asm!(
+                "vmovdqu64 zmm0, [{input}]",
+                "vpxord zmm1, zmm0, dword ptr [rip + {comma}]{{1to16}}",
+                "vptestnmb k1, zmm1, zmm1",
+                "vpxord zmm2, zmm0, dword ptr [rip + {lf}]{{1to16}}",
+                "vptestnmb k2, zmm2, zmm2",
+                "vpxord zmm3, zmm0, dword ptr [rip + {quote}]{{1to16}}",
+                "vptestnmb k3, zmm3, zmm3",
+                "kmovq {cm}, k1",
+                "kmovq {nl}, k2",
+                "kmovq {qt}, k3",
+                input = in(reg) block.as_ptr(),
+                comma = sym COMMA, lf = sym LF, quote = sym QUOTE,
+                cm = lateout(reg) commas, nl = lateout(reg) linefeeds,
+                qt = lateout(reg) quotes,
+                out("zmm0") _, out("zmm1") _, out("zmm2") _, out("zmm3") _,
+                out("k1") _, out("k2") _, out("k3") _,
+                options(pure, readonly, nostack, preserves_flags),
+            );
+        }
+        state.consume(Masks { commas, linefeeds, quotes }, data, &mut visit);
+    }
+    let tail = blocks.remainder();
+    let mut last = scalar_mask(tail);
+    last.linefeeds |= 1 << tail.len();
+    state.consume(last, data, &mut visit);
 }
 
 #[cfg(test)]
@@ -196,7 +211,7 @@ mod tests {
         #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
         if available() {
             let mut actual = Vec::new();
-            unsafe { rows(data, |v: [&[u8]; N]| actual.push(v.map(<[u8]>::to_vec))) };
+            unsafe { register_rows_tuned(data, |v: [&[u8]; N]| actual.push(v.map(<[u8]>::to_vec))) };
             assert_eq!(actual, expected);
         }
     }

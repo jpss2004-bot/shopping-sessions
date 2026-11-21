@@ -58,7 +58,7 @@ pub fn rows<const N: usize>(chunk: &[u8], visit: impl FnMut([&[u8]; N])) {
     let selected = Scanner::for_process();
     #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
     if selected == Scanner::Wide {
-        return unsafe { crate::wide::rows(chunk, visit) };
+        return unsafe { crate::wide::register_rows_tuned(chunk, visit) };
     }
     #[cfg(target_arch = "x86_64")]
     if selected == Scanner::WholeIntel {
