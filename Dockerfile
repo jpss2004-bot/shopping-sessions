@@ -1,11 +1,13 @@
-FROM rust:1.85.1-slim-bookworm AS normalizer
+FROM rust:1.85.1-slim-bookworm@sha256:3490aa77d179a59d67e94239cca96dd84030b564470859200f535b942bdffedf AS normalizer
 COPY native/normalize.rs /src/normalize.rs
 RUN rustc --edition=2024 -C opt-level=3 -o /normalize /src/normalize.rs
 
 WORKDIR /src/engine
 COPY native/Cargo.toml native/Cargo.lock ./
 COPY native/src/ src/
-RUN cargo build --release --locked
+COPY scripts/pgo.sh /pgo.sh
+COPY profiles/amd64/ /profiles/amd64/
+RUN bash /pgo.sh build /profiles/amd64 /shopping-sessions
 
 FROM python:3.12-slim-bookworm
 
@@ -17,7 +19,7 @@ RUN pip install --no-cache-dir -r /app/requirements.txt
 
 COPY pipeline/ /app/pipeline/
 COPY --from=normalizer /normalize /app/normalize
-COPY --from=normalizer /src/engine/target/release/shopping-sessions /app/shopping-sessions
+COPY --from=normalizer /shopping-sessions /app/shopping-sessions
 COPY run.sh /app/run.sh
 RUN chmod +x /app/run.sh
 
