@@ -201,6 +201,34 @@ fn merge_campaigns(shards: impl IntoIterator<Item = CampaignDays>) -> CampaignDa
     totals
 }
 
+// Keep graph continuations out of the event-task queue while both stages run.
+// After the initial join, downstream stages again use the original full pool.
+fn parse_and_link<A: Send, B: Send>(
+    threads: usize,
+    links: impl FnOnce() -> A + Send,
+    events: impl FnOnce() -> B + Send,
+) -> Result<(A, B)> {
+    let reserved = std::env::var("LINK_WORKERS")
+        .unwrap_or_else(|_| "0".into())
+        .parse::<usize>()?;
+    if reserved == 0 || threads == 1 {
+        return Ok(rayon::join(links, events));
+    }
+    if reserved >= threads {
+        return Err("LINK_WORKERS must leave at least one event worker".into());
+    }
+    let graph_pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(reserved)
+        .build()?;
+    let event_pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(threads - reserved)
+        .build()?;
+    Ok(std::thread::scope(|s| {
+        let graph = s.spawn(|| graph_pool.install(links));
+        let parsed = event_pool.install(events);
+        (graph.join().expect("identity worker panicked"), parsed)
+    }))
+}
 fn run() -> Result<()> {
     let start = Instant::now();
     let profile = env::var_os("PROFILE").is_some();
@@ -285,7 +313,8 @@ fn run() -> Result<()> {
         return Err("unknown EVENT_DEDUP".into());
     }
     let early = env::var_os("EARLY_EXACT").is_some() && mode == "singletons";
-    let (canon, parsed) = rayon::join(
+    let (canon, parsed) = parse_and_link(
+        threads,
         || {
             mark("links_start");
             let canon = link_map(&data, &keys);
@@ -368,7 +397,7 @@ fn run() -> Result<()> {
                 Parsed::Copies(parsed)
             }
         },
-    );
+    )?;
     mark("join_released");
     let canon = canon?;
     drop(events);
