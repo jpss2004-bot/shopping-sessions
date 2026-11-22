@@ -44,7 +44,33 @@ impl Default for Keys {
     }
 }
 
-pub struct Names([Vec<Arc<[u8]>>; NAME_SHARDS]);
+pub struct Names {
+    labels: [Vec<Arc<[u8]>>; NAME_SHARDS],
+    clicks: Vec<ClickBytes>,
+}
+
+#[derive(Default)]
+pub struct ClickBytes {
+    data: Vec<u8>,
+    ends: Vec<usize>,
+}
+impl ClickBytes {
+    pub fn key(&mut self, group: u32, bytes: &[u8]) -> Key {
+        if let Some(key) = Keys::inline_id(bytes) {
+            return key;
+        }
+        assert!(u64::from(group) < 1 << 31);
+        let index = u32::try_from(self.ends.len()).expect("more than 2^32 long clicks in one group");
+        self.data.extend_from_slice(bytes);
+        self.ends.push(self.data.len());
+        LONG | (u64::from(group) << 32) | u64::from(index)
+    }
+
+    fn get(&self, index: usize) -> &[u8] {
+        let start = if index == 0 { 0 } else { self.ends[index - 1] };
+        &self.data[start..self.ends[index]]
+    }
+}
 
 impl Keys {
     pub fn id(&self, s: &[u8]) -> Key {
@@ -118,17 +144,39 @@ impl Keys {
     }
 
     pub fn names(&self) -> Names {
-        Names(std::array::from_fn(|shard| {
-            self.shards[shard].lock().unwrap().names.clone()
-        }))
+        Names {
+            labels: std::array::from_fn(|shard| self.shards[shard].lock().unwrap().names.clone()),
+            clicks: Vec::new(),
+        }
     }
 }
 impl Names {
+    pub fn with_clicks(mut self, clicks: Vec<ClickBytes>) -> Self {
+        self.clicks = clicks;
+        self
+    }
+
+    fn click_bytes<'a>(&'a self, key: Key, buf: &'a mut [u8; 9]) -> &'a [u8] {
+        if key & LONG == 0 {
+            self.bytes(key, buf)
+        } else {
+            let group = ((key ^ LONG) >> 32) as usize;
+            self.clicks[group].get(key as u32 as usize)
+        }
+    }
+
+    pub fn click_less(&self, a: Key, b: Key) -> bool {
+        if (a | b) & LONG == 0 {
+            return a < b;
+        }
+        self.click_bytes(a, &mut [0; 9]) < self.click_bytes(b, &mut [0; 9])
+    }
+
     pub fn bytes<'a>(&'a self, key: Key, buf: &'a mut [u8; 9]) -> &'a [u8] {
         if key & LONG != 0 {
             let shard = key as usize % NAME_SHARDS;
             let index = ((key ^ LONG) >> NAME_SHARDS.trailing_zeros()) as usize;
-            return &self.0[shard][index];
+            return &self.labels[shard][index];
         }
         let mut k = key;
         let mut len = 0;
@@ -363,6 +411,22 @@ mod dictionary_tests {
             assert_ne!(a.event_fingerprint(bytes) & LONG, 0);
             assert_eq!(a.event_fingerprint(bytes), b.event_fingerprint(bytes));
         }
+    }
+
+    #[test]
+    fn compares_click_bytes_across_fragments_and_inline_names() {
+        let keys = Keys::default();
+        let mut left = ClickBytes::default();
+        let mut right = ClickBytes::default();
+        let a = left.key(0, b"long click ID ");
+        let b = right.key(1, b"long click ID!");
+        let duplicate = right.key(1, b"long click ID ");
+        let short = right.key(1, b"long");
+        let names = keys.names().with_clicks(vec![left, right]);
+        assert!(names.click_less(short, a));
+        assert!(names.click_less(a, b));
+        assert!(!names.click_less(a, duplicate));
+        assert!(!names.click_less(duplicate, a));
     }
 
     #[test]

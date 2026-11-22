@@ -117,7 +117,7 @@ pub fn summarize(
         for session in &sessions {
             while next < ads.len() && ads[next].ts <= session.ts {
                 let c = &ads[next];
-                if latest.is_none_or(|old| c.ts > old.ts || names.less(c.id, old.id)) {
+                if latest.is_none_or(|old| c.ts > old.ts || names.click_less(c.id, old.id)) {
                     latest = Some(c);
                 }
                 next += 1;

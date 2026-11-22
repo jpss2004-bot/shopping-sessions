@@ -457,10 +457,13 @@ fn run() -> Result<()> {
     report_buffers("linked events", &events);
     mark("deduplicated and linked events");
     let clicks = Files::open(&data.join("clicks"))?;
-    let ads: Vec<_> = clicks
+    let (ads, click_bytes): (Vec<_>, Vec<_>) = clicks
         .chunks()
         .par_chunks(group_size)
-        .map(|group| {
+        .enumerate()
+        .map(|(ordinal, group)| {
+            let ordinal = u32::try_from(ordinal).expect("too many input groups");
+            let mut click_bytes = input::ClickBytes::default();
             let mut parts = reserved_buckets(group.iter().map(|c| c.len()).sum::<usize>() / 38);
             for chunk in group {
                 rows(chunk, |[id, user, campaign, ts]| {
@@ -479,14 +482,14 @@ fn run() -> Result<()> {
                     parts[shard(user)].push(Click {
                         user,
                         ts,
-                        id: keys.id(id),
+                        id: click_bytes.key(ordinal, id),
                         campaign,
                     });
                 });
             }
-            parts
+            (parts, click_bytes)
         })
-        .collect();
+        .unzip();
     report_buffers("clicks", &ads);
     drop(clicks);
     if profile {
@@ -504,7 +507,7 @@ fn run() -> Result<()> {
         drop(canon);
     }
     mark("parsed clicks");
-    let names = keys.names();
+    let names = keys.names().with_clicks(click_bytes);
     let users = output.join("user_daily");
     let campaign_dir = output.join("campaign_daily");
     fs::create_dir_all(&users)?;
