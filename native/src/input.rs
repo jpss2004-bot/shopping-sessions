@@ -6,7 +6,7 @@ use std::{
     fs::{self, File},
     io,
     path::Path,
-    sync::Mutex,
+    sync::{Arc, Mutex},
 };
 
 pub const BAD: i64 = i64::MIN;
@@ -15,14 +15,30 @@ pub const WEEK: i64 = 7 * DAY;
 pub type Key = u64;
 const LONG: Key = 1 << 63;
 
+const NAME_SHARDS: usize = 128;
+
 #[derive(Default)]
 struct Dictionary {
-    ids: AHashMap<Vec<u8>, Key>,
-    names: Vec<Vec<u8>>,
+    ids: AHashMap<Arc<[u8]>, usize>,
+    names: Vec<Arc<[u8]>>,
 }
-#[derive(Default)]
-pub struct Keys(Mutex<Dictionary>);
-pub struct Names(Vec<Vec<u8>>);
+
+pub struct Keys {
+    shards: [Mutex<Dictionary>; NAME_SHARDS],
+    hash: ahash::RandomState,
+}
+
+impl Default for Keys {
+    fn default() -> Self {
+        Self {
+            shards: std::array::from_fn(|_| Mutex::default()),
+            hash: ahash::RandomState::new(),
+        }
+    }
+}
+
+pub struct Names([Vec<Arc<[u8]>>; NAME_SHARDS]);
+
 impl Keys {
     pub fn id(&self, s: &[u8]) -> Key {
         if s.is_empty() {
@@ -61,23 +77,33 @@ impl Keys {
                 return value << (7 * (9 - s.len()));
             }
         }
-        let mut dict = self.0.lock().unwrap();
-        if let Some(&k) = dict.ids.get(s) {
-            return k;
-        }
-        let k = LONG | dict.names.len() as u64;
-        dict.ids.insert(s.to_vec(), k);
-        dict.names.push(s.to_vec());
-        k
+        let shard = self.hash.hash_one(s) as usize % NAME_SHARDS;
+        let mut dict = self.shards[shard].lock().unwrap();
+        let index = match dict.ids.get(s) {
+            Some(&index) => index,
+            None => {
+                let index = dict.names.len();
+                let bytes = Arc::<[u8]>::from(s);
+                dict.names.push(Arc::clone(&bytes));
+                dict.ids.insert(bytes, index);
+                index
+            }
+        };
+        LONG | ((index as Key) << NAME_SHARDS.trailing_zeros()) | shard as Key
     }
+
     pub fn names(&self) -> Names {
-        Names(self.0.lock().unwrap().names.clone())
+        Names(std::array::from_fn(|shard| {
+            self.shards[shard].lock().unwrap().names.clone()
+        }))
     }
 }
 impl Names {
     pub fn bytes<'a>(&'a self, key: Key, buf: &'a mut [u8; 9]) -> &'a [u8] {
         if key & LONG != 0 {
-            return &self.0[(key ^ LONG) as usize];
+            let shard = key as usize % NAME_SHARDS;
+            let index = ((key ^ LONG) >> NAME_SHARDS.trailing_zeros()) as usize;
+            return &self.0[shard][index];
         }
         let mut k = key;
         let mut len = 0;
@@ -288,5 +314,37 @@ impl Month {
             return BAD;
         }
         self.base + (d - 1) * DAY + ((h * 60 + m) * 60 + sec) * 1000
+    }
+}
+
+#[cfg(test)]
+mod dictionary_tests {
+    use super::*;
+
+    #[test]
+    fn long_ids_round_trip_when_shards_grow_concurrently() {
+        let keys = Keys::default();
+        let ids: Vec<_> = (0..2048).map(|i| format!("user-with-a-long-common-prefix-{i}")).collect();
+        std::thread::scope(|scope| {
+            for offset in 0..4 {
+                let keys = &keys;
+                let ids = &ids;
+                scope.spawn(move || {
+                    for i in 0..ids.len() {
+                        keys.id(ids[(i + offset * 23) % ids.len()].as_bytes());
+                    }
+                });
+            }
+        });
+        let snapshot = keys.names();
+        let mut buf = [0; 9];
+        for value in ids {
+            assert_eq!(snapshot.bytes(keys.id(value.as_bytes()), &mut buf), value.as_bytes());
+        }
+        let a = keys.id(b"foo");
+        let b = keys.id(b"foo with a space");
+        let names = keys.names();
+        assert!(names.less(a, b));
+        assert!(!names.less(b, a));
     }
 }
