@@ -1,7 +1,9 @@
 mod clockfast;
 mod compact;
 mod dedup;
+mod endpoint;
 mod fastrows;
+use endpoint::Canon;
 mod identity;
 mod identity_index;
 mod input;
@@ -23,28 +25,35 @@ use tables::{CampaignDays, Click, Event};
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 const SHARDS: usize = 128;
 
-fn link_map(data: &Path, keys: &Keys) -> Result<AHashMap<Key, Key>> {
+fn link_map(data: &Path, keys: &Keys) -> Result<Canon> {
     let start = Instant::now();
+    let profile = env::var_os("PROFILE").is_some();
     let files = Files::open(&data.join("links"))?;
     let chunks = files.chunks();
-    let edges: Vec<Vec<_>> = chunks
-        .par_iter()
-        .map(|s| {
-            let mut edges = Vec::new();
-            rows(s, |[a, b]| {
-                if !a.is_empty() && !b.is_empty() {
-                    edges.push((keys.id(a), keys.id(b)))
-                }
+    let mode = env::var("IDENTITY_ENGINE").unwrap_or_else(|_| "stock".into());
+    let (result, loaded) = match mode.as_str() {
+        "stock" | "compact" | "bucket" => {
+            let edges = endpoint::timed_chunks(&chunks, profile, |s| {
+                let mut edges = Vec::new();
+                rows(s, |[a, b]| {
+                    if !a.is_empty() && !b.is_empty() {
+                        edges.push((keys.id(a), keys.id(b)))
+                    }
+                });
+                edges
             });
-            edges
-        })
-        .collect();
-    let loaded = start.elapsed();
-    let result = match env::var("IDENTITY_ENGINE").as_deref() {
-        Ok("compact") => identity_index::compact(edges, keys),
-        Ok("bucket") => identity_index::bucketed(edges, keys),
-        Ok("stock") | Err(std::env::VarError::NotPresent) => identity::build(edges, keys),
-        _ => return Err("IDENTITY_ENGINE must be stock, compact or bucket".into()),
+            let loaded = start.elapsed();
+            let map = match mode.as_str() {
+                "bucket" => identity_index::bucketed(edges, keys),
+                "compact" => identity_index::compact(edges, keys),
+                _ => identity::build(edges, keys),
+            };
+            (Canon::Flat(map), loaded)
+        }
+        "decode8" | "decode16" | "decode32" | "decode64" => {
+            endpoint::build(&chunks, keys, mode[6..].parse()?, profile, start)
+        }
+        _ => return Err("unknown IDENTITY_ENGINE".into()),
     };
     let graph_time = start.elapsed() - loaded;
     if env::var_os("PROFILE").is_some() {
@@ -57,7 +66,7 @@ fn link_map(data: &Path, keys: &Keys) -> Result<AHashMap<Key, Key>> {
     if env::var_os("LINK_BENCH").is_some() {
         let names = keys.names();
         let mut fingerprint = 0u64;
-        for (&key, &canonical) in &result {
+        for (&key, &canonical) in result.maps().iter().flat_map(|m| m.iter()) {
             let digest = |k| {
                 names
                     .bytes(k, &mut [0; 9])
@@ -73,7 +82,7 @@ fn link_map(data: &Path, keys: &Keys) -> Result<AHashMap<Key, Key>> {
             "linkbench graph_us={} load_us={} mappings={} fingerprint={:016x}",
             graph_time.as_micros(),
             loaded.as_micros(),
-            result.len(),
+            result.maps().iter().map(|m| m.len()).sum::<usize>(),
             fingerprint
         );
     }
@@ -132,16 +141,11 @@ struct CopyOfEvent {
     ingest: i64,
     event: Event,
 }
-fn winners(
-    packed: Vec<compact::Part>,
-    origin: i64,
-    mode: &str,
-    canon: &AHashMap<Key, Key>,
-) -> Vec<Vec<Event>> {
+fn winners(packed: Vec<compact::Part>, origin: i64, mode: &str, canon: &Canon) -> Vec<Vec<Event>> {
     let mut out = reserved_buckets(packed.iter().map(compact::Part::len).sum());
     let mut emit = |mut e: Event| {
         if e.ts != BAD {
-            e.user = *canon.get(&e.user).unwrap_or(&e.user);
+            e.user = canon.resolve(e.user);
             out[shard(e.user)].push(e);
         }
     };
@@ -261,6 +265,18 @@ fn run() -> Result<()> {
         .unwrap_or(4)
         .max(1);
     mark("join_start");
+    enum Parsed {
+        Copies(Vec<Vec<compact::Part>>),
+        Winners(Vec<Vec<Event>>),
+    }
+    let mode = env::var("EVENT_DEDUP").unwrap_or_else(|_| "singletons".into());
+    if !matches!(
+        mode.as_str(),
+        "sort" | "hash" | "radix" | "compact-hash" | "singletons"
+    ) {
+        return Err("unknown EVENT_DEDUP".into());
+    }
+    let early = env::var_os("EARLY_EXACT").is_some() && mode == "singletons";
     let (canon, parsed) = rayon::join(
         || {
             mark("links_start");
@@ -324,35 +340,67 @@ fn run() -> Result<()> {
                 })
                 .collect::<Vec<_>>();
             mark("events_ready");
-            parsed
+            if early {
+                let winners = compact::transpose(parsed)
+                    .into_par_iter()
+                    .map(|parts| {
+                        let mut selected =
+                            Vec::with_capacity(parts.iter().map(compact::Part::len).sum());
+                        compact::select(&parts, lo, |event| {
+                            if event.ts != BAD {
+                                selected.push(event)
+                            }
+                        });
+                        selected
+                    })
+                    .collect();
+                mark("exact_selection_done");
+                Parsed::Winners(winners)
+            } else {
+                Parsed::Copies(parsed)
+            }
         },
     );
     mark("join_released");
     let canon = canon?;
     drop(events);
     mark("parsed events and resolved identities");
-    let mode = env::var("EVENT_DEDUP").unwrap_or_else(|_| "singletons".into());
-    if !matches!(
-        mode.as_str(),
-        "sort" | "hash" | "radix" | "compact-hash" | "singletons"
-    ) {
-        return Err("unknown EVENT_DEDUP".into());
-    }
-    if env::var_os("PROFILE_MEMORY").is_some() {
-        compact::report(&parsed);
-    }
     let first_winner = std::sync::atomic::AtomicBool::new(true);
-    let events = redistribute(
-        compact::transpose(parsed)
-            .into_par_iter()
-            .map(|parts| {
-                if profile && first_winner.swap(false, std::sync::atomic::Ordering::Relaxed) {
-                    mark("first_dedup_task");
-                }
-                winners(parts, lo, &mode, &canon)
-            })
-            .collect(),
-    );
+    let events = match parsed {
+        Parsed::Copies(parsed) => {
+            if env::var_os("PROFILE_MEMORY").is_some() {
+                compact::report(&parsed);
+            }
+            redistribute(
+                compact::transpose(parsed)
+                    .into_par_iter()
+                    .map(|parts| {
+                        if profile && first_winner.swap(false, std::sync::atomic::Ordering::Relaxed)
+                        {
+                            mark("first_dedup_task");
+                        }
+                        winners(parts, lo, &mode, &canon)
+                    })
+                    .collect(),
+            )
+        }
+        Parsed::Winners(groups) => {
+            mark("first_canonical_routing");
+            redistribute(
+                groups
+                    .into_par_iter()
+                    .map(|group| {
+                        let mut out = reserved_buckets(group.len());
+                        for mut e in group {
+                            e.user = canon.resolve(e.user);
+                            out[shard(e.user)].push(e);
+                        }
+                        out
+                    })
+                    .collect(),
+            )
+        }
+    };
     report_buffers("linked events", &events);
     mark("deduplicated and linked events");
     let clicks = Files::open(&data.join("clicks"))?;
@@ -374,7 +422,7 @@ fn run() -> Result<()> {
                         return;
                     };
                     let user = keys.id(user);
-                    let user = *canon.get(&user).unwrap_or(&user);
+                    let user = canon.resolve(user);
                     parts[shard(user)].push(Click {
                         user,
                         ts,
@@ -388,7 +436,20 @@ fn run() -> Result<()> {
         .collect();
     report_buffers("clicks", &ads);
     drop(clicks);
-    drop(canon);
+    if profile {
+        let capacity = canon.maps().iter().map(|map| map.capacity()).sum::<usize>();
+        let entries = canon.maps().iter().map(|map| map.len()).sum::<usize>();
+        let rss = endpoint::rss_kib();
+        let since = Instant::now();
+        drop(canon);
+        let us = since.elapsed().as_micros();
+        eprintln!(
+            "alias_release entries={entries} capacity={capacity} drop_us={us} rss_before_kib={rss} rss_after_kib={}",
+            endpoint::rss_kib()
+        );
+    } else {
+        drop(canon);
+    }
     mark("parsed clicks");
     let names = keys.names();
     let users = output.join("user_daily");
