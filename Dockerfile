@@ -6,8 +6,9 @@ WORKDIR /src/engine
 COPY native/Cargo.toml native/Cargo.lock ./
 COPY native/src/ src/
 # Compare both writer schedules in the same uninstrumented release build.
-RUN --mount=type=cache,target=/usr/local/cargo/registry --mount=type=cache,target=/build \
-    CARGO_BUILD_JOBS=4 RUSTFLAGS="-Ctarget-cpu=x86-64" cargo build --locked \
+RUN --mount=type=cache,target=/usr/local/cargo/registry --mount=type=cache,target=/build,sharing=locked \
+    cargo clean --release --target x86_64-unknown-linux-gnu --target-dir /build -p shopping-sessions \
+    && CARGO_BUILD_JOBS=4 RUSTFLAGS="-Ctarget-cpu=x86-64" cargo build --locked \
       --release --target x86_64-unknown-linux-gnu --target-dir /build \
     && cp /build/x86_64-unknown-linux-gnu/release/shopping-sessions /shopping-sessions
 
