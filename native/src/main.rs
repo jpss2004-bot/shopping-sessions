@@ -2,6 +2,7 @@ mod clockfast;
 mod compact;
 mod dedup;
 mod endpoint;
+mod event_hex;
 mod fastrows;
 use endpoint::Canon;
 mod identity;
@@ -342,7 +343,17 @@ fn run() -> Result<()> {
                             }
                             let id_bytes = id;
                             let inline = Keys::inline_id(id_bytes);
-                            let id = inline.unwrap_or_else(|| keys.event_fingerprint(id_bytes));
+                            let hex = if inline.is_none() {
+                                event_hex::pack(id_bytes)
+                            } else {
+                                None
+                            };
+                            let id = inline.unwrap_or_else(|| {
+                                hex.map_or_else(
+                                    || keys.event_fingerprint(id_bytes),
+                                    |(primary, _)| primary,
+                                )
+                            });
                             let ts = clockfast::event(&month, ts);
                             let ingest = month.ingest(ingest);
                             let purchase = kind == b"purchase";
@@ -381,6 +392,8 @@ fn run() -> Result<()> {
                             let target = &mut parts[shard(id)];
                             if inline.is_some() {
                                 target.push(id, ingest, event, lo);
+                            } else if let Some((primary, secondary)) = hex {
+                                target.push_hex(primary, secondary, ingest, event, lo);
                             } else {
                                 target.push_opaque(id, id_bytes, ingest, event, lo);
                             }

@@ -23,18 +23,34 @@ struct Extended {
     event: Event,
     ingest: i64,
 }
+const HEX_ROW: usize = 1usize << (usize::BITS - 1);
 struct OpaqueSpan {
     row: usize,
-    end: usize,
+    value: u64,
+}
+impl OpaqueSpan {
+    fn index(&self) -> usize {
+        self.row & !HEX_ROW
+    }
+    fn is_hex(&self) -> bool {
+        self.row & HEX_ROW != 0
+    }
+}
+#[derive(Hash, PartialEq, Eq)]
+enum ExactOpaque<'a> {
+    Bytes(&'a [u8]),
+    Hex(u64, u64),
 }
 pub(crate) struct Part {
     rows: Vec<Packed>,
     overflow: Vec<Extended>,
     opaque: Vec<OpaqueSpan>,
     opaque_bytes: Vec<u8>,
+    hex_rows: usize,
 }
 
 const _: () = assert!(size_of::<Packed>() == 24);
+const _: () = assert!(size_of::<OpaqueSpan>() == 16);
 const _: () = assert!(size_of::<Extended>() == 32);
 
 impl Part {
@@ -44,6 +60,7 @@ impl Part {
             overflow: Vec::new(),
             opaque: Vec::new(),
             opaque_bytes: Vec::new(),
+            hex_rows: 0,
         }
     }
     pub(crate) fn len(&self) -> usize {
@@ -94,9 +111,27 @@ impl Part {
         self.opaque_bytes.extend_from_slice(bytes);
         self.opaque.push(OpaqueSpan {
             row,
-            end: self.opaque_bytes.len(),
+            value: self.opaque_bytes.len() as u64,
         });
         self.push(fingerprint, ingest, event, origin);
+    }
+
+    pub(crate) fn push_hex(
+        &mut self,
+        primary: Key,
+        secondary: u64,
+        ingest: i64,
+        event: Event,
+        origin: i64,
+    ) {
+        let row = self.rows.len();
+        assert_eq!(row & HEX_ROW, 0);
+        self.opaque.push(OpaqueSpan {
+            row: row | HEX_ROW,
+            value: secondary,
+        });
+        self.hex_rows += 1;
+        self.push(primary, ingest, event, origin);
     }
 
     #[inline(always)]
@@ -160,13 +195,16 @@ pub(crate) fn report_opaque(blocks: &[Vec<Part>]) {
     let mut rows = 0;
     let mut bytes = 0;
     let mut capacity = 0;
+    let mut hex_rows = 0;
     for part in blocks.iter().flatten() {
         rows += part.opaque.len();
+        hex_rows += part.hex_rows;
         bytes += part.opaque_bytes.len();
         capacity += part.opaque.capacity() * size_of::<OpaqueSpan>() + part.opaque_bytes.capacity();
     }
     eprintln!(
-        "opaque_event_buffers rows={rows} copied_id_bytes={bytes} live_span_bytes={} allocated_sidecar_bytes={capacity}",
+        "opaque_event_buffers rows={rows} hex_rows={hex_rows} avoided_id_bytes={} copied_id_bytes={bytes} live_span_bytes={} allocated_sidecar_bytes={capacity}",
+        hex_rows * 33,
         rows * size_of::<OpaqueSpan>()
     );
 }
@@ -174,14 +212,21 @@ pub(crate) fn report_opaque(blocks: &[Vec<Part>]) {
 // Diagnostic algorithms require exact integer keys. Their owner resolves bytes
 // before expanding rows, retaining the separate high-bit namespace.
 pub(crate) fn resolve_opaque(parts: &mut [Part]) {
-    let mut ids = AHashMap::<&[u8], Key>::new();
+    let mut ids = AHashMap::<ExactOpaque<'_>, Key>::new();
     for part in parts {
         let mut start = 0;
         for span in &part.opaque {
-            let key = &part.opaque_bytes[start..span.end];
+            let index = span.index();
+            let key = if span.is_hex() {
+                ExactOpaque::Hex(part.rows[index].id, span.value)
+            } else {
+                let end = span.value as usize;
+                let key = ExactOpaque::Bytes(&part.opaque_bytes[start..end]);
+                start = end;
+                key
+            };
             let next = (1u64 << 63) | ids.len() as u64;
-            part.rows[span.row].id = *ids.entry(key).or_insert(next);
-            start = span.end;
+            part.rows[index].id = *ids.entry(key).or_insert(next);
         }
     }
 }
@@ -267,22 +312,31 @@ fn select_opaque(
     count: usize,
     mut emit: impl FnMut(Event),
 ) {
-    let mut inline = AHashMap::<Key, (&Part, &Packed)>::with_capacity(count / 16);
-    let mut opaque = AHashMap::<&[u8], (&Part, &Packed)>::with_capacity(count / 16);
+    let opaque_count: usize = parts.iter().map(|p| p.opaque.len()).sum();
+    let hex_count: usize = parts.iter().map(|p| p.hex_rows).sum();
+    let mut inline = AHashMap::<Key, (&Part, &Packed)>::with_capacity((count - opaque_count) / 16);
+    let mut opaque =
+        AHashMap::<&[u8], (&Part, &Packed)>::with_capacity((opaque_count - hex_count) / 16);
+    let mut hex = AHashMap::<(u64, u64), (&Part, &Packed)>::with_capacity(hex_count / 16);
     for part in parts {
         let mut next_span = 0;
         let mut bytes_start = 0;
         for (index, row) in part.rows.iter().enumerate() {
-            let bytes = if part
+            let identity = if part
                 .opaque
                 .get(next_span)
-                .is_some_and(|span| span.row == index)
+                .is_some_and(|s| s.index() == index)
             {
-                let end = part.opaque[next_span].end;
-                let bytes = &part.opaque_bytes[bytes_start..end];
-                bytes_start = end;
+                let span = &part.opaque[next_span];
                 next_span += 1;
-                Some(bytes)
+                if span.is_hex() {
+                    Some(ExactOpaque::Hex(row.id, span.value))
+                } else {
+                    let end = span.value as usize;
+                    let bytes = &part.opaque_bytes[bytes_start..end];
+                    bytes_start = end;
+                    Some(ExactOpaque::Bytes(bytes))
+                }
             } else {
                 None
             };
@@ -291,38 +345,40 @@ fn select_opaque(
                 emit(part.event(row, origin));
                 continue;
             }
-            let entry = if let Some(bytes) = bytes {
-                opaque.entry(bytes)
-            } else {
-                // The inline map has a different key type, so handle it here.
-                match inline.entry(row.id) {
-                    Entry::Vacant(v) => {
-                        v.insert((part, row));
-                    }
-                    Entry::Occupied(mut v) => {
-                        let (old_part, old) = *v.get();
-                        if part.ingest(row, origin) < old_part.ingest(old, origin) {
-                            v.insert((part, row));
-                        }
-                    }
+            match identity {
+                Some(ExactOpaque::Hex(primary, secondary)) => {
+                    update(&mut hex, (primary, secondary), part, row, origin)
                 }
-                continue;
-            };
-            match entry {
-                Entry::Vacant(v) => {
-                    v.insert((part, row));
-                }
-                Entry::Occupied(mut v) => {
-                    let (old_part, old) = *v.get();
-                    if part.ingest(row, origin) < old_part.ingest(old, origin) {
-                        v.insert((part, row));
-                    }
-                }
+                Some(ExactOpaque::Bytes(bytes)) => update(&mut opaque, bytes, part, row, origin),
+                None => update(&mut inline, row.id, part, row, origin),
             }
         }
     }
-    for (part, row) in inline.into_values().chain(opaque.into_values()) {
+    for (part, row) in inline
+        .into_values()
+        .chain(opaque.into_values())
+        .chain(hex.into_values())
+    {
         emit(part.event(row, origin));
+    }
+}
+fn update<'a, K: Eq + std::hash::Hash>(
+    table: &mut AHashMap<K, (&'a Part, &'a Packed)>,
+    key: K,
+    part: &'a Part,
+    row: &'a Packed,
+    origin: i64,
+) {
+    match table.entry(key) {
+        Entry::Vacant(v) => {
+            v.insert((part, row));
+        }
+        Entry::Occupied(mut v) => {
+            let (old_part, old) = *v.get();
+            if part.ingest(row, origin) < old_part.ingest(old, origin) {
+                v.insert((part, row));
+            }
+        }
     }
 }
 
@@ -337,6 +393,38 @@ mod tests {
             category,
         }
     }
+    #[test]
+    fn hex_secondary_and_namespaces_remain_exact_under_primary_collisions() {
+        for mode in ["singletons", "sort", "hash", "radix", "compact-hash"] {
+            let mut a = Part::with_capacity(0);
+            let mut b = Part::with_capacity(0);
+            a.push_opaque(17, b"generic-before", 900, event(44, 80, 3, 1), 0);
+            a.push_hex(17, 1, 900, event(11, 100, 99, 2), 0);
+            a.push_opaque(17, b"generic-after", 900, event(55, 90, 4, 2), 0);
+            a.push_hex(17, 2, 900, event(22, 110, 41, 1), 0);
+            a.push(17, 900, event(33, 120, 0, 0), 0);
+            b.push_hex(17, 1, 700, event(0, BAD, 0, 0), 0);
+            b.push_hex(17, 2, 800, event(22, 105, 43, 1), 0);
+            let canon = crate::endpoint::Canon::Flat(AHashMap::new());
+            let mut got: Vec<_> = crate::winners(vec![a, b], 0, mode, &canon)
+                .into_iter()
+                .flatten()
+                .map(|e| (e.user, e.ts, e.price, e.category))
+                .collect();
+            got.sort_unstable();
+            assert_eq!(
+                got,
+                [
+                    (22, 105, 43, 1),
+                    (33, 120, 0, 0),
+                    (44, 80, 3, 1),
+                    (55, 90, 4, 2)
+                ],
+                "mode {mode}"
+            );
+        }
+    }
+
     fn collision_parts() -> Vec<Part> {
         let fp = (1u64 << 63) | 17;
         let mut a = Part::with_capacity(0);
