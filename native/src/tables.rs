@@ -49,6 +49,13 @@ pub fn summarize(
     let mut sessions = Vec::<Session>::new();
     let mut category_revenue = Vec::<(u32, i64)>::new();
     let mut last_interval = AHashMap::<u32, (i64, i64)>::new();
+    // For a short click history one pass per session can assign credit and
+    // count distinct assists without building a campaign interval table.
+    let short_click_limit = std::env::var("SHORT_ASSIST_LIMIT")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(8)
+        .min(16);
     let mut add_person = |person: &[Event], ads: &[Click]| {
         let user = person[0].user;
         sessions.clear();
@@ -111,6 +118,39 @@ pub fn summarize(
             }
         }
         finish(daily.unwrap(), &mut category_revenue, &mut users);
+
+        if short_click_limit != 0 && ads.len() <= short_click_limit {
+            for session in &sessions {
+                let mut seen = [0u32; 16];
+                let mut count = 0;
+                let mut latest: Option<&Click> = None;
+                for click in ads {
+                    if click.ts > session.ts {
+                        break;
+                    }
+                    if session.ts - click.ts > WEEK {
+                        continue;
+                    }
+                    if latest.is_none_or(|old| {
+                        click.ts > old.ts || names.click_less(click.id, old.id)
+                    }) {
+                        latest = Some(click);
+                    }
+                    if !seen[..count].contains(&click.campaign) {
+                        seen[count] = click.campaign;
+                        count += 1;
+                        campaigns.entry((click.campaign, session.day)).or_default().assists += 1;
+                    }
+                }
+                let credit = campaigns
+                    .entry((latest.map_or(0, |click| click.campaign), session.day))
+                    .or_default();
+                credit.sessions += 1;
+                credit.revenue += session.revenue;
+                credit.purchases += i64::from(session.revenue != 0);
+            }
+            return;
+        }
 
         let mut next = 0;
         let mut latest: Option<&Click> = None;
