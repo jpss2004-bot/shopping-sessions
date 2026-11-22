@@ -29,7 +29,15 @@ fn link_map(data: &Path, keys: &Keys) -> Result<Canon> {
     let start = Instant::now();
     let profile = env::var_os("PROFILE").is_some();
     let files = Files::open(&data.join("links"))?;
+    let opened = start.elapsed();
     let chunks = files.chunks();
+    if profile {
+        eprintln!(
+            "link_input open_us={} split_us={}",
+            opened.as_micros(),
+            (start.elapsed() - opened).as_micros()
+        );
+    }
     let mode = env::var("IDENTITY_ENGINE").unwrap_or_else(|_| "stock".into());
     let (result, loaded) = match mode.as_str() {
         "stock" | "compact" | "bucket" => {

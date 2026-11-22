@@ -74,6 +74,20 @@ pub fn timed_chunks<T: Send>(
             (result, Some((i, bytes.len(), begin, end, cpu_ns)))
         })
         .collect();
+    let returned = dispatch.elapsed();
+    if profile {
+        let last = work
+            .iter()
+            .filter_map(|(_, sample)| sample.as_ref().map(|(_, _, _, end, _)| *end))
+            .max()
+            .unwrap_or_default();
+        eprintln!(
+            "link_dispatch collect_us={} last_worker_done_us={} resume_gap_us={}",
+            returned.as_micros(),
+            last.as_micros(),
+            returned.saturating_sub(last).as_micros()
+        );
+    }
     work.into_iter()
         .map(|(result, sample)| {
             if let Some((i, bytes, begin, end, cpu)) = sample {
