@@ -23,9 +23,37 @@ struct Dictionary {
     names: Vec<Arc<[u8]>>,
 }
 
+#[derive(Default)]
+struct EventDictionary {
+    first: AHashMap<u64, usize>,
+    entries: Vec<(std::ops::Range<usize>, Option<usize>)>,
+    bytes: Vec<u8>,
+}
+
+impl EventDictionary {
+    fn intern(&mut self, digest: u64, bytes: &[u8]) -> usize {
+        let mut previous = self.first.get(&digest).copied();
+        let head = previous;
+        while let Some(index) = previous {
+            let (range, next) = &self.entries[index];
+            if &self.bytes[range.clone()] == bytes {
+                return index;
+            }
+            previous = *next;
+        }
+        let index = self.entries.len();
+        let start = self.bytes.len();
+        self.bytes.extend_from_slice(bytes);
+        self.entries.push((start..self.bytes.len(), head));
+        self.first.insert(digest, index);
+        index
+    }
+}
+
 pub struct Keys {
     shards: [Mutex<Dictionary>; NAME_SHARDS],
     hash: ahash::RandomState,
+    event_shards: [Mutex<EventDictionary>; NAME_SHARDS],
 }
 
 impl Default for Keys {
@@ -33,6 +61,7 @@ impl Default for Keys {
         Self {
             shards: std::array::from_fn(|_| Mutex::default()),
             hash: ahash::RandomState::new(),
+            event_shards: std::array::from_fn(|_| Mutex::default()),
         }
     }
 }
@@ -41,8 +70,23 @@ pub struct Names([Vec<Arc<[u8]>>; NAME_SHARDS]);
 
 impl Keys {
     pub fn id(&self, s: &[u8]) -> Key {
+        Self::inline_id(s).unwrap_or_else(|| self.name_id(s))
+    }
+
+    // Event IDs are compared only with other event IDs and never appear in output.
+    pub fn event_id(&self, s: &[u8]) -> Key {
+        Self::inline_id(s).unwrap_or_else(|| {
+            let digest = self.hash.hash_one(s);
+            let shard = digest as usize % NAME_SHARDS;
+            let index = self.event_shards[shard].lock().unwrap().intern(digest, s);
+            LONG | ((index as Key) << NAME_SHARDS.trailing_zeros()) | shard as Key
+        })
+    }
+
+    #[inline]
+    fn inline_id(s: &[u8]) -> Option<Key> {
         if s.is_empty() {
-            return 0;
+            return Some(0);
         }
         if s.len() == 9 && s[0] > 0 && s[0] < 128 {
             let bytes = u64::from_be_bytes(s[1..].try_into().unwrap());
@@ -53,7 +97,7 @@ impl Keys {
                 {
                     // PEXT retains the seven payload bits in each byte in order.
                     let payload = unsafe { std::arch::x86_64::_pext_u64(bytes, !high) };
-                    return (u64::from(s[0]) << 56) | payload;
+                    return Some((u64::from(s[0]) << 56) | payload);
                 }
                 #[cfg(not(all(target_arch = "x86_64", target_feature = "bmi2")))]
                 {
@@ -62,7 +106,7 @@ impl Keys {
                         (bytes & 0x007f_007f_007f_007f) | ((bytes & 0x7f00_7f00_7f00_7f00) >> 1);
                     let quads =
                         (pairs & 0x0000_3fff_0000_3fff) | ((pairs & 0x3fff_0000_3fff_0000) >> 2);
-                    return (u64::from(s[0]) << 56) | (quads & 0x0fff_ffff) | ((quads >> 32) << 28);
+                    return Some((u64::from(s[0]) << 56) | (quads & 0x0fff_ffff) | ((quads >> 32) << 28));
                 }
             }
         }
@@ -74,9 +118,13 @@ impl Keys {
                 value = (value << 7) | u64::from(byte);
             }
             if fits {
-                return value << (7 * (9 - s.len()));
+                return Some(value << (7 * (9 - s.len())));
             }
         }
+        None
+    }
+
+    fn name_id(&self, s: &[u8]) -> Key {
         let shard = self.hash.hash_one(s) as usize % NAME_SHARDS;
         let mut dict = self.shards[shard].lock().unwrap();
         let index = match dict.ids.get(s) {
@@ -320,6 +368,16 @@ impl Month {
 #[cfg(test)]
 mod dictionary_tests {
     use super::*;
+
+    #[test]
+    fn event_hash_collisions_preserve_distinct_opaque_ids() {
+        let mut table = EventDictionary::default();
+        let a = table.intern(9, b"a space and a comma,");
+        let b = table.intern(9, b"a space and a comma, too");
+        assert_ne!(a, b);
+        assert_eq!(a, table.intern(9, b"a space and a comma,"));
+        assert_eq!(b, table.intern(9, b"a space and a comma, too"));
+    }
 
     #[test]
     fn long_ids_round_trip_when_shards_grow_concurrently() {

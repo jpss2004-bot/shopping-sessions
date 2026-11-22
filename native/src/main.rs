@@ -334,7 +334,7 @@ fn run() -> Result<()> {
                             if id.is_empty() {
                                 return;
                             }
-                            let id = keys.id(id);
+                            let id = keys.event_id(id);
                             let ts = clockfast::event(&month, ts);
                             let ingest = month.ingest(ingest);
                             let purchase = kind == b"purchase";
