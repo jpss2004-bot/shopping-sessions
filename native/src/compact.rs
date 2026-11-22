@@ -23,9 +23,15 @@ struct Extended {
     event: Event,
     ingest: i64,
 }
+struct OpaqueSpan {
+    row: usize,
+    end: usize,
+}
 pub(crate) struct Part {
     rows: Vec<Packed>,
     overflow: Vec<Extended>,
+    opaque: Vec<OpaqueSpan>,
+    opaque_bytes: Vec<u8>,
 }
 
 const _: () = assert!(size_of::<Packed>() == 24);
@@ -36,6 +42,8 @@ impl Part {
         Self {
             rows: Vec::with_capacity(capacity),
             overflow: Vec::new(),
+            opaque: Vec::new(),
+            opaque_bytes: Vec::new(),
         }
     }
     pub(crate) fn len(&self) -> usize {
@@ -72,6 +80,23 @@ impl Part {
             }
         };
         self.rows.push(row);
+    }
+
+    pub(crate) fn push_opaque(
+        &mut self,
+        fingerprint: Key,
+        bytes: &[u8],
+        ingest: i64,
+        event: Event,
+        origin: i64,
+    ) {
+        let row = self.rows.len();
+        self.opaque_bytes.extend_from_slice(bytes);
+        self.opaque.push(OpaqueSpan {
+            row,
+            end: self.opaque_bytes.len(),
+        });
+        self.push(fingerprint, ingest, event, origin);
     }
 
     #[inline(always)]
@@ -131,6 +156,36 @@ pub(crate) fn transpose(blocks: Vec<Vec<Part>>) -> Vec<Vec<Part>> {
     shards
 }
 
+pub(crate) fn report_opaque(blocks: &[Vec<Part>]) {
+    let mut rows = 0;
+    let mut bytes = 0;
+    let mut capacity = 0;
+    for part in blocks.iter().flatten() {
+        rows += part.opaque.len();
+        bytes += part.opaque_bytes.len();
+        capacity += part.opaque.capacity() * size_of::<OpaqueSpan>() + part.opaque_bytes.capacity();
+    }
+    eprintln!(
+        "opaque_event_buffers rows={rows} copied_id_bytes={bytes} live_span_bytes={} allocated_sidecar_bytes={capacity}",
+        rows * size_of::<OpaqueSpan>()
+    );
+}
+
+// Diagnostic algorithms require exact integer keys. Their owner resolves bytes
+// before expanding rows, retaining the separate high-bit namespace.
+pub(crate) fn resolve_opaque(parts: &mut [Part]) {
+    let mut ids = AHashMap::<&[u8], Key>::new();
+    for part in parts {
+        let mut start = 0;
+        for span in &part.opaque {
+            let key = &part.opaque_bytes[start..span.end];
+            let next = (1u64 << 63) | ids.len() as u64;
+            part.rows[span.row].id = *ids.entry(key).or_insert(next);
+            start = span.end;
+        }
+    }
+}
+
 pub(crate) fn report(blocks: &[Vec<Part>]) {
     let mut rows = 0;
     let mut extended = 0;
@@ -172,6 +227,10 @@ pub(crate) fn select(parts: &[Part], origin: i64, mut emit: impl FnMut(Event)) {
             w.seen |= b;
         }
     }
+    if parts.iter().any(|part| !part.opaque.is_empty()) {
+        select_opaque(parts, origin, &bitmap, count, emit);
+        return;
+    }
     let mut ambiguous = AHashMap::<Key, (&Part, &Packed)>::with_capacity(count / 16);
     for part in parts {
         for row in &part.rows {
@@ -198,6 +257,75 @@ pub(crate) fn select(parts: &[Part], origin: i64, mut emit: impl FnMut(Event)) {
     }
 }
 
+// A false singleton hit always enters an exact map. Fingerprint collisions can
+// increase work but cannot equate distinct strings. All map keys borrow bytes
+// from immutable Parts that remain alive until the map's winners are emitted.
+fn select_opaque(
+    parts: &[Part],
+    origin: i64,
+    bitmap: &[Bits],
+    count: usize,
+    mut emit: impl FnMut(Event),
+) {
+    let mut inline = AHashMap::<Key, (&Part, &Packed)>::with_capacity(count / 16);
+    let mut opaque = AHashMap::<&[u8], (&Part, &Packed)>::with_capacity(count / 16);
+    for part in parts {
+        let mut next_span = 0;
+        let mut bytes_start = 0;
+        for (index, row) in part.rows.iter().enumerate() {
+            let bytes = if part
+                .opaque
+                .get(next_span)
+                .is_some_and(|span| span.row == index)
+            {
+                let end = part.opaque[next_span].end;
+                let bytes = &part.opaque_bytes[bytes_start..end];
+                bytes_start = end;
+                next_span += 1;
+                Some(bytes)
+            } else {
+                None
+            };
+            let (word, bits) = location(row.id, bitmap.len() - 1);
+            if bitmap[word].repeated & bits != bits {
+                emit(part.event(row, origin));
+                continue;
+            }
+            let entry = if let Some(bytes) = bytes {
+                opaque.entry(bytes)
+            } else {
+                // The inline map has a different key type, so handle it here.
+                match inline.entry(row.id) {
+                    Entry::Vacant(v) => {
+                        v.insert((part, row));
+                    }
+                    Entry::Occupied(mut v) => {
+                        let (old_part, old) = *v.get();
+                        if part.ingest(row, origin) < old_part.ingest(old, origin) {
+                            v.insert((part, row));
+                        }
+                    }
+                }
+                continue;
+            };
+            match entry {
+                Entry::Vacant(v) => {
+                    v.insert((part, row));
+                }
+                Entry::Occupied(mut v) => {
+                    let (old_part, old) = *v.get();
+                    if part.ingest(row, origin) < old_part.ingest(old, origin) {
+                        v.insert((part, row));
+                    }
+                }
+            }
+        }
+    }
+    for (part, row) in inline.into_values().chain(opaque.into_values()) {
+        emit(part.event(row, origin));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -209,6 +337,63 @@ mod tests {
             category,
         }
     }
+    fn collision_parts() -> Vec<Part> {
+        let fp = (1u64 << 63) | 17;
+        let mut a = Part::with_capacity(0);
+        let mut b = Part::with_capacity(0);
+        let mut c = Part::with_capacity(0);
+        // Same fingerprint, distinct exact bytes. The invalid earlier copy of A
+        // arrives in the last fragment and must suppress only A's purchase.
+        a.push_opaque(fp, b"opaque-A, with spaces", 900, event(11, 300, 99, 2), 0);
+        a.push_opaque(fp, b"opaque-B, with spaces", 900, event(22, 310, 41, 1), 0);
+        a.push(17, 200, event(33, 190, 0, 0), 0);
+        b.push_opaque(fp, b"opaque-B, with spaces", 800, event(22, 305, 43, 1), 0);
+        b.push_opaque(fp, b"opaque-B, with spaces", 800, event(22, 306, 47, 1), 0);
+        b.push_opaque(fp, b"opaque-\0C\xff", i64::MAX, event(44, 320, 17, 2), 0);
+        c.push_opaque(fp, b"opaque-A, with spaces", 700, event(0, BAD, 0, 0), 0);
+        c.push(17, 100, event(33, 90, 0, 0), 0);
+        vec![a, b, c]
+    }
+
+    #[test]
+    fn opaque_hash_collisions_and_late_invalid_copies_use_exact_bytes() {
+        let expected = vec![(22, 305, 43, 1), (33, 90, 0, 0), (44, 320, 17, 2)];
+        for mode in ["singletons", "sort", "hash", "radix", "compact-hash"] {
+            let canon = crate::endpoint::Canon::Flat(AHashMap::new());
+            let mut got: Vec<_> = crate::winners(collision_parts(), 0, mode, &canon)
+                .into_iter()
+                .flatten()
+                .map(|e| (e.user, e.ts, e.price, e.category))
+                .collect();
+            got.sort_unstable();
+            assert_eq!(got, expected, "mode {mode}");
+        }
+    }
+
+    #[test]
+    fn unique_opaque_fingerprints_and_empty_fragments_keep_their_payloads() {
+        let keys = crate::input::Keys::default();
+        let mut part = Part::with_capacity(0);
+        for i in 0..5000u64 {
+            let bytes = format!("opaque-identifier-{}-é", i);
+            part.push_opaque(
+                keys.event_fingerprint(bytes.as_bytes()),
+                bytes.as_bytes(),
+                i as i64,
+                event(i, 10_000 + i as i64, (i % 3) as u32, 1),
+                0,
+            );
+        }
+        let parts = [Part::with_capacity(0), part, Part::with_capacity(0)];
+        let mut got = Vec::new();
+        select(&parts, 0, |e| got.push((e.user, e.ts, e.price, e.category)));
+        got.sort_unstable();
+        let expected: Vec<_> = (0..5000u64)
+            .map(|i| (i, 10_000 + i as i64, (i % 3) as u32, 1))
+            .collect();
+        assert_eq!(got, expected);
+    }
+
     #[test]
     fn layout_and_every_overflow_roundtrip() {
         for origin in [0_i64, 1_800_909_000_000, i64::MAX - 100, i64::MIN + 100] {

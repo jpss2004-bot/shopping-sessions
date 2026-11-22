@@ -149,7 +149,12 @@ struct CopyOfEvent {
     ingest: i64,
     event: Event,
 }
-fn winners(packed: Vec<compact::Part>, origin: i64, mode: &str, canon: &Canon) -> Vec<Vec<Event>> {
+fn winners(
+    mut packed: Vec<compact::Part>,
+    origin: i64,
+    mode: &str,
+    canon: &Canon,
+) -> Vec<Vec<Event>> {
     let mut out = reserved_buckets(packed.iter().map(compact::Part::len).sum());
     let mut emit = |mut e: Event| {
         if e.ts != BAD {
@@ -161,6 +166,7 @@ fn winners(packed: Vec<compact::Part>, origin: i64, mode: &str, canon: &Canon) -
         compact::select(&packed, origin, emit);
         return out;
     }
+    compact::resolve_opaque(&mut packed);
     let mut copies: Vec<CopyOfEvent> = packed
         .into_iter()
         .flat_map(|part| part.expand(origin))
@@ -334,7 +340,9 @@ fn run() -> Result<()> {
                             if id.is_empty() {
                                 return;
                             }
-                            let id = keys.event_id(id);
+                            let id_bytes = id;
+                            let inline = Keys::inline_id(id_bytes);
+                            let id = inline.unwrap_or_else(|| keys.event_fingerprint(id_bytes));
                             let ts = clockfast::event(&month, ts);
                             let ingest = month.ingest(ingest);
                             let purchase = kind == b"purchase";
@@ -370,12 +378,20 @@ fn run() -> Result<()> {
                                     category: 0,
                                 }
                             };
-                            parts[shard(id)].push(id, ingest, event, lo);
+                            let target = &mut parts[shard(id)];
+                            if inline.is_some() {
+                                target.push(id, ingest, event, lo);
+                            } else {
+                                target.push_opaque(id, id_bytes, ingest, event, lo);
+                            }
                         });
                     }
                     parts
                 })
                 .collect::<Vec<_>>();
+            if profile {
+                compact::report_opaque(&parsed);
+            }
             mark("events_ready");
             if early {
                 let winners = compact::transpose(parsed)

@@ -23,37 +23,10 @@ struct Dictionary {
     names: Vec<Arc<[u8]>>,
 }
 
-#[derive(Default)]
-struct EventDictionary {
-    first: AHashMap<u64, usize>,
-    entries: Vec<(std::ops::Range<usize>, Option<usize>)>,
-    bytes: Vec<u8>,
-}
-
-impl EventDictionary {
-    fn intern(&mut self, digest: u64, bytes: &[u8]) -> usize {
-        let mut previous = self.first.get(&digest).copied();
-        let head = previous;
-        while let Some(index) = previous {
-            let (range, next) = &self.entries[index];
-            if &self.bytes[range.clone()] == bytes {
-                return index;
-            }
-            previous = *next;
-        }
-        let index = self.entries.len();
-        let start = self.bytes.len();
-        self.bytes.extend_from_slice(bytes);
-        self.entries.push((start..self.bytes.len(), head));
-        self.first.insert(digest, index);
-        index
-    }
-}
-
 pub struct Keys {
     shards: [Mutex<Dictionary>; NAME_SHARDS],
     hash: ahash::RandomState,
-    event_shards: [Mutex<EventDictionary>; NAME_SHARDS],
+    event_hash: ahash::RandomState,
 }
 
 impl Default for Keys {
@@ -61,7 +34,12 @@ impl Default for Keys {
         Self {
             shards: std::array::from_fn(|_| Mutex::default()),
             hash: ahash::RandomState::new(),
-            event_shards: std::array::from_fn(|_| Mutex::default()),
+            event_hash: ahash::RandomState::with_seeds(
+                0x29a7_411b_208d_e311,
+                0xba12_03e9_7915_d455,
+                0x4e82_32af_810d_0071,
+                0x6d89_5ea3_fa00_b907,
+            ),
         }
     }
 }
@@ -73,18 +51,15 @@ impl Keys {
         Self::inline_id(s).unwrap_or_else(|| self.name_id(s))
     }
 
-    // Event IDs are compared only with other event IDs and never appear in output.
-    pub fn event_id(&self, s: &[u8]) -> Key {
-        Self::inline_id(s).unwrap_or_else(|| {
-            let digest = self.hash.hash_one(s);
-            let shard = digest as usize % NAME_SHARDS;
-            let index = self.event_shards[shard].lock().unwrap().intern(digest, s);
-            LONG | ((index as Key) << NAME_SHARDS.trailing_zeros()) | shard as Key
-        })
+    // Fingerprints route opaque event bytes. Equality is established from the
+    // original bytes in the shard owner whenever a fingerprint is ambiguous.
+    #[inline]
+    pub(crate) fn event_fingerprint(&self, s: &[u8]) -> Key {
+        LONG | (self.event_hash.hash_one(s) & !LONG)
     }
 
     #[inline]
-    fn inline_id(s: &[u8]) -> Option<Key> {
+    pub(crate) fn inline_id(s: &[u8]) -> Option<Key> {
         if s.is_empty() {
             return Some(0);
         }
@@ -106,7 +81,9 @@ impl Keys {
                         (bytes & 0x007f_007f_007f_007f) | ((bytes & 0x7f00_7f00_7f00_7f00) >> 1);
                     let quads =
                         (pairs & 0x0000_3fff_0000_3fff) | ((pairs & 0x3fff_0000_3fff_0000) >> 2);
-                    return Some((u64::from(s[0]) << 56) | (quads & 0x0fff_ffff) | ((quads >> 32) << 28));
+                    return Some(
+                        (u64::from(s[0]) << 56) | (quads & 0x0fff_ffff) | ((quads >> 32) << 28),
+                    );
                 }
             }
         }
@@ -370,19 +347,30 @@ mod dictionary_tests {
     use super::*;
 
     #[test]
-    fn event_hash_collisions_preserve_distinct_opaque_ids() {
-        let mut table = EventDictionary::default();
-        let a = table.intern(9, b"a space and a comma,");
-        let b = table.intern(9, b"a space and a comma, too");
-        assert_ne!(a, b);
-        assert_eq!(a, table.intern(9, b"a space and a comma,"));
-        assert_eq!(b, table.intern(9, b"a space and a comma, too"));
+    fn opaque_fingerprints_have_a_namespace_separate_from_inline_ids() {
+        let a = Keys::default();
+        let b = Keys::default();
+        for bytes in [
+            b"abc".as_slice(),
+            b"ninechars",
+            b"a long ID including a comma,",
+            b"\0",
+            &[255],
+        ] {
+            if let Some(inline) = Keys::inline_id(bytes) {
+                assert_eq!(inline & LONG, 0);
+            }
+            assert_ne!(a.event_fingerprint(bytes) & LONG, 0);
+            assert_eq!(a.event_fingerprint(bytes), b.event_fingerprint(bytes));
+        }
     }
 
     #[test]
     fn long_ids_round_trip_when_shards_grow_concurrently() {
         let keys = Keys::default();
-        let ids: Vec<_> = (0..2048).map(|i| format!("user-with-a-long-common-prefix-{i}")).collect();
+        let ids: Vec<_> = (0..2048)
+            .map(|i| format!("user-with-a-long-common-prefix-{i}"))
+            .collect();
         std::thread::scope(|scope| {
             for offset in 0..4 {
                 let keys = &keys;
@@ -397,7 +385,10 @@ mod dictionary_tests {
         let snapshot = keys.names();
         let mut buf = [0; 9];
         for value in ids {
-            assert_eq!(snapshot.bytes(keys.id(value.as_bytes()), &mut buf), value.as_bytes());
+            assert_eq!(
+                snapshot.bytes(keys.id(value.as_bytes()), &mut buf),
+                value.as_bytes()
+            );
         }
         let a = keys.id(b"foo");
         let b = keys.id(b"foo with a space");
