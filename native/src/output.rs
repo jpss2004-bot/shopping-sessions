@@ -93,11 +93,7 @@ pub fn users<T: AsRef<[UserDay]>>(
     for shard in shards {
         for batch in shard.as_ref().chunks(65536) {
             let mut g = out.next_row_group()?;
-            let ids = if compact {
-                user_names(batch, names)
-            } else {
-                batch.iter().map(|r| string(names, r.user)).collect()
-            };
+            let ids = user_names(batch, names);
             column::<ByteArrayType>(&mut g, ids, None)?;
             column::<Int32Type>(&mut g, batch.iter().map(|r| r.day).collect(), None)?;
             column::<Int64Type>(&mut g, batch.iter().map(|r| r.sessions).collect(), None)?;
