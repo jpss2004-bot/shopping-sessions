@@ -7,6 +7,8 @@ export DATA_DIR OUTPUT_DIR SCRATCH_DIR
 export TMPDIR="$SCRATCH_DIR" HOME="$SCRATCH_DIR"
 case "${ENGINE:-native}" in
     native)
+        # The practice scorer passes only its standard environment.
+        export IDENTITY_ENGINE="${IDENTITY_ENGINE:-bucket}" LINK_WORKERS="${LINK_WORKERS:-1}"
         # Set LD_PRELOAD to an empty value to measure the system allocator.
         export LD_PRELOAD="${LD_PRELOAD-libmimalloc.so.2}"
         exec /app/shopping-sessions
